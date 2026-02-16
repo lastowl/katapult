@@ -19,9 +19,11 @@ import errno
 import argparse
 import hashlib
 import pathlib
+import platform
 import shutil
 import shlex
 import contextlib
+import array
 from typing import Dict, List, Optional, Union, Any
 HAS_SERIAL = True
 try:
@@ -29,6 +31,43 @@ try:
 except ModuleNotFoundError:
     HAS_SERIAL = False
     SerialException = Exception
+
+# Platform-aware custom baudrate support (fixes MIPS compatibility)
+# MIPS uses different IOCTL values and struct offsets than other platforms
+# See: https://github.com/pyserial/pyserial/commit/5ce1773
+def _is_mips() -> bool:
+    return platform.machine().lower().startswith("mips")
+
+if _is_mips():
+    TCGETS2 = 0x4030542A
+    TCSETS2 = 0x8030542B
+    BAUDRATE_OFFSET = 10
+else:
+    TCGETS2 = 0x802C542A
+    TCSETS2 = 0x402C542B
+    BAUDRATE_OFFSET = 9
+
+def set_custom_baudrate(fd: int, baudrate: int) -> bool:
+    """
+    Set a custom baudrate on a serial port file descriptor.
+    Works around PySerial's MIPS incompatibility by using platform-specific
+    IOCTL values. Returns True on success, False on failure.
+    """
+    BOTHER = 0o010000
+    try:
+        # Get current termios2 settings
+        buf = array.array('i', [0] * 64)
+        fcntl.ioctl(fd, TCGETS2, buf)
+        # Set custom baudrate flags and values
+        buf[2] &= ~termios.CBAUD
+        buf[2] |= BOTHER
+        buf[BAUDRATE_OFFSET] = baudrate
+        buf[BAUDRATE_OFFSET + 1] = baudrate
+        # Apply new settings
+        fcntl.ioctl(fd, TCSETS2, buf)
+        return True
+    except (OSError, IOError):
+        return False
 
 def output_line(msg: str) -> None:
     sys.stdout.write(msg + "\n")
@@ -1019,12 +1058,30 @@ class SerialSocket(BaseSocket):
             self.close()
 
     def _open_device(self, device: str, baud: int) -> Serial:
+        # Standard baudrates supported by termios
+        STANDARD_BAUDRATES = {
+            50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800,
+            9600, 19200, 38400, 57600, 115200, 230400, 460800, 500000,
+            576000, 921600, 1000000, 1152000, 1500000, 2000000, 2500000,
+            3000000, 3500000, 4000000
+        }
+        is_custom_baud = baud not in STANDARD_BAUDRATES
         try:
             serial_dev = Serial(                            # type: ignore
-                baudrate=baud, timeout=0, exclusive=True
+                baudrate=9600 if is_custom_baud else baud,
+                timeout=0, exclusive=True
             )
             serial_dev.port = device
             serial_dev.open()
+            # Apply custom baudrate using platform-aware IOCTL
+            # This fixes MIPS compatibility issues with PySerial
+            if is_custom_baud:
+                if not set_custom_baudrate(serial_dev.fileno(), baud):
+                    logging.warning(
+                        f"Failed to set custom baudrate {baud} via IOCTL, "
+                        f"falling back to PySerial"
+                    )
+                    serial_dev.baudrate = baud
         except (OSError, IOError, SerialException) as e:
             raise FlashError("Unable to open serial port: %s" % (e,))
         return serial_dev
